@@ -1,0 +1,280 @@
+name: Update Chart and Release
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+env:
+  CHART_FILE: charts/pgadmin4/Chart.yaml
+  DOCKER_REPO: dpage/pgadmin4
+
+jobs:
+  update-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest image tag from Docker Hub
+        id: get_tag
+        run: |
+          set -euo pipefail
+
+          echo "🔍 Fetching latest tags from Docker Hub..."
+
+          RESPONSE=$(curl -fsSL \
+            "https://registry.hub.docker.com/v2/repositories/${{ env.DOCKER_REPO }}/tags/?page_size=25&ordering=last_updated")
+
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to fetch tags from Docker Hub"
+            exit 1
+          fi
+
+          ALL_TAGS=$(echo "$RESPONSE" | jq -r '.results[].name')
+
+          if [ -z "$ALL_TAGS" ]; then
+            echo "❌ No tags found in Docker Hub response"
+            exit 1
+          fi
+
+          echo "📋 Available tags (first 25):"
+          echo "$ALL_TAGS" | head -n 25
+
+          # 过滤出符合语义化版本号的标签 (x.y.z 格式)
+          # 排除 latest, dev, beta 等非版本号标签
+          SEMVER_TAGS=$(echo "$ALL_TAGS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+
+          if [ -z "$SEMVER_TAGS" ]; then
+            echo "⚠️  No valid semantic version tags (x.y.z) found, skipping update"
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "📌 Valid semantic version tags:"
+          echo "$SEMVER_TAGS"
+
+          # 使用 sort -V 进行版本号排序，获取最新版本
+          LATEST_TAG=$(echo "$SEMVER_TAGS" | sort -V | tail -n1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "⚠️  Failed to determine latest version, skipping update"
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "should_skip=false" >> $GITHUB_OUTPUT
+          echo "✅ Latest semantic version tag: $LATEST_TAG"
+
+      - name: Check if update is needed
+        id: check_update
+        if: steps.get_tag.outputs.should_skip != 'true'
+        run: |
+          set -euo pipefail
+
+          LATEST_TAG="${{ steps.get_tag.outputs.latest_tag }}"
+
+          if [ ! -f "$CHART_FILE" ]; then
+            echo "❌ Chart file not found: $CHART_FILE"
+            exit 1
+          fi
+
+          CURRENT_APP_VERSION=$(grep '^appVersion:' "$CHART_FILE" | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+          echo "📊 Version comparison:"
+          echo "  Current: $CURRENT_APP_VERSION"
+          echo "  Latest:  $LATEST_TAG"
+
+          if [ "$LATEST_TAG" = "$CURRENT_APP_VERSION" ]; then
+            echo "should_update=false" >> $GITHUB_OUTPUT
+            echo "✅ Already up to date"
+            exit 0
+          fi
+
+          # 使用版本号比较函数
+          compare_versions() {
+            local ver1=$1
+            local ver2=$2
+
+            # 使用 sort -V 比较版本号
+            if [ "$(printf '%s\n%s' "$ver1" "$ver2" | sort -V | head -n1)" = "$ver1" ] && [ "$ver1" != "$ver2" ]; then
+              return 1  # ver1 < ver2
+            else
+              return 0  # ver1 >= ver2
+            fi
+          }
+
+          if compare_versions "$CURRENT_APP_VERSION" "$LATEST_TAG"; then
+            echo "should_update=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  Current version ($CURRENT_APP_VERSION) is equal to or newer than latest ($LATEST_TAG)"
+          else
+            echo "should_update=true" >> $GITHUB_OUTPUT
+            echo "⬆️  Update available: $CURRENT_APP_VERSION -> $LATEST_TAG"
+          fi
+
+      - name: Update Chart.yaml
+        id: update_chart
+        if: steps.check_update.outputs.should_update == 'true'
+        run: |
+          set -euo pipefail
+
+          NEW_APP_VERSION="${{ steps.get_tag.outputs.latest_tag }}"
+
+          # 获取当前版本号
+          CURRENT_CHART_VERSION=$(grep '^version:' "$CHART_FILE" | awk '{print $2}' | tr -d '"' | tr -d "'")
+          CURRENT_APP_VERSION=$(grep '^appVersion:' "$CHART_FILE" | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+          echo "📊 Current versions:"
+          echo "  Chart version: $CURRENT_CHART_VERSION"
+          echo "  App version:   $CURRENT_APP_VERSION"
+
+          # 解析当前 Chart 版本号
+          CHART_MAJOR=$(echo "$CURRENT_CHART_VERSION" | cut -d. -f1)
+          CHART_MINOR=$(echo "$CURRENT_CHART_VERSION" | cut -d. -f2)
+          CHART_PATCH=$(echo "$CURRENT_CHART_VERSION" | cut -d. -f3)
+
+          # 解析当前和新的 App 版本号
+          CURRENT_APP_MAJOR=$(echo "$CURRENT_APP_VERSION" | cut -d. -f1)
+          CURRENT_APP_MINOR=$(echo "$CURRENT_APP_VERSION" | cut -d. -f2)
+          CURRENT_APP_PATCH=$(echo "$CURRENT_APP_VERSION" | cut -d. -f3)
+
+          NEW_APP_MAJOR=$(echo "$NEW_APP_VERSION" | cut -d. -f1)
+          NEW_APP_MINOR=$(echo "$NEW_APP_VERSION" | cut -d. -f2)
+          NEW_APP_PATCH=$(echo "$NEW_APP_VERSION" | cut -d. -f3)
+
+          # 确保所有版本号组件都有值
+          CHART_MAJOR=${CHART_MAJOR:-0}
+          CHART_MINOR=${CHART_MINOR:-0}
+          CHART_PATCH=${CHART_PATCH:-0}
+
+          # 根据 appVersion 的变化类型，同步升级 Chart 版本号
+          if [ "$NEW_APP_MAJOR" -gt "$CURRENT_APP_MAJOR" ]; then
+            # Major 版本升级
+            NEW_CHART_MAJOR=$((CHART_MAJOR + 1))
+            NEW_CHART_MINOR=0
+            NEW_CHART_PATCH=0
+            VERSION_TYPE="MAJOR"
+            echo "🚀 Detected MAJOR version bump in appVersion"
+          elif [ "$NEW_APP_MINOR" -gt "$CURRENT_APP_MINOR" ]; then
+            # Minor 版本升级
+            NEW_CHART_MAJOR=$CHART_MAJOR
+            NEW_CHART_MINOR=$((CHART_MINOR + 1))
+            NEW_CHART_PATCH=0
+            VERSION_TYPE="MINOR"
+            echo "📈 Detected MINOR version bump in appVersion"
+          elif [ "$NEW_APP_PATCH" -gt "$CURRENT_APP_PATCH" ]; then
+            # Patch 版本升级
+            NEW_CHART_MAJOR=$CHART_MAJOR
+            NEW_CHART_MINOR=$CHART_MINOR
+            NEW_CHART_PATCH=$((CHART_PATCH + 1))
+            VERSION_TYPE="PATCH"
+            echo "🔧 Detected PATCH version bump in appVersion"
+          else
+            # 理论上不应该到这里，因为前面已经检查过版本
+            NEW_CHART_MAJOR=$CHART_MAJOR
+            NEW_CHART_MINOR=$CHART_MINOR
+            NEW_CHART_PATCH=$((CHART_PATCH + 1))
+            VERSION_TYPE="PATCH"
+            echo "⚠️  Fallback to PATCH version bump"
+          fi
+
+          NEW_CHART_VERSION="${NEW_CHART_MAJOR}.${NEW_CHART_MINOR}.${NEW_CHART_PATCH}"
+
+          echo ""
+          echo "📦 Version update summary:"
+          echo "  Chart: $CURRENT_CHART_VERSION -> $NEW_CHART_VERSION ($VERSION_TYPE)"
+          echo "  App:   $CURRENT_APP_VERSION -> $NEW_APP_VERSION ($VERSION_TYPE)"
+
+          # 更新 Chart.yaml 文件
+          sed -i "s|^version:.*|version: $NEW_CHART_VERSION|" "$CHART_FILE"
+          sed -i "s|^appVersion:.*|appVersion: $NEW_APP_VERSION|" "$CHART_FILE"
+
+          echo "new_version=$NEW_CHART_VERSION" >> $GITHUB_OUTPUT
+          echo "new_app_version=$NEW_APP_VERSION" >> $GITHUB_OUTPUT
+          echo "version_type=$VERSION_TYPE" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "✅ Updated $CHART_FILE:"
+          grep -E '^(version|appVersion):' "$CHART_FILE"
+
+      - name: Commit and push changes
+        if: steps.check_update.outputs.should_update == 'true'
+        run: |
+          set -euo pipefail
+
+          # 保存当前版本号用于 commit message
+          CURRENT_CHART_VERSION=$(grep '^version:' "$CHART_FILE" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+          CURRENT_APP_VERSION=$(grep '^appVersion:' "$CHART_FILE" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$CHART_FILE"
+
+          if git diff --staged --quiet; then
+            echo "ℹ️  No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore(chart): bump nexus-repository-manager to ${{ steps.update_chart.outputs.new_app_version }} (${{ steps.update_chart.outputs.version_type }})" \
+            -m "- Update appVersion: $CURRENT_APP_VERSION -> ${{ steps.update_chart.outputs.new_app_version }}" \
+            -m "- Bump chart version: $CURRENT_CHART_VERSION -> ${{ steps.update_chart.outputs.new_version }}" \
+            -m "- Version type: ${{ steps.update_chart.outputs.version_type }}"
+
+          git push
+
+          echo "✅ Changes committed and pushed"
+
+      - name: Set up Helm
+        if: steps.check_update.outputs.should_update == 'true'
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Run chart-releaser
+        if: steps.check_update.outputs.should_update == 'true'
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          charts_dir: charts
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Summary
+        if: steps.check_update.outputs.should_update == 'true'
+        run: |
+          # 从 git log 获取之前的版本号
+          PREV_CHART_VERSION=$(git show HEAD~1:$CHART_FILE | grep '^version:' | awk '{print $2}' | tr -d '"' | tr -d "'")
+          PREV_APP_VERSION=$(git show HEAD~1:$CHART_FILE | grep '^appVersion:' | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+          echo "## 🎉 Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Version Updates (${{ steps.update_chart.outputs.version_type }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | Previous | New |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Chart Version | \`${PREV_CHART_VERSION}\` | \`${{ steps.update_chart.outputs.new_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Version | \`${PREV_APP_VERSION}\` | \`${{ steps.update_chart.outputs.new_app_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Chart has been released successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: No update summary
+        if: steps.get_tag.outputs.should_skip == 'true' || steps.check_update.outputs.should_update == 'false'
+        run: |
+          echo "## ℹ️  No Update Required" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.get_tag.outputs.should_skip }}" = "true" ]; then
+            echo "No valid semantic version tags (x.y.z) found in Docker Hub." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Chart is already up to date." >> $GITHUB_STEP_SUMMARY
+          fi
